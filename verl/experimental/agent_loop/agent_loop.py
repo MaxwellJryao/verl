@@ -654,15 +654,15 @@ class AgentLoopWorker:
             response_output["input_ids"] = response_output["input_ids"].unsqueeze(0)
             response_output["attention_mask"] = response_output["attention_mask"].unsqueeze(0)
 
-        response_mask_output = self.tokenizer.pad(
-            {"input_ids": output.response_mask},
-            padding="max_length",
-            max_length=self.rollout_config.response_length,
-            return_tensors="pt",
-            return_attention_mask=False,
-        )
-        if response_mask_output["input_ids"].dim() == 1:
-            response_mask_output["input_ids"] = response_mask_output["input_ids"].unsqueeze(0)
+        response_mask_ids = output.response_mask
+        if not isinstance(response_mask_ids, torch.Tensor):
+            response_mask_ids = torch.tensor(response_mask_ids)
+        pad_size = self.rollout_config.response_length - response_mask_ids.shape[-1]
+        if pad_size > 0:
+            response_mask_ids = torch.nn.functional.pad(response_mask_ids, (0, pad_size), value=0)
+        if response_mask_ids.dim() == 1:
+            response_mask_ids = response_mask_ids.unsqueeze(0)
+        response_mask_output = {"input_ids": response_mask_ids}
 
         response_logprobs = None
         if output.response_logprobs is not None:
@@ -777,12 +777,12 @@ class AgentLoopWorker:
             return_tensors="pt",
             do_sample_frames=False,
         )
-        multi_modal_inputs.pop("input_ids", None)
-        multi_modal_inputs.pop("attention_mask", None)
+        # Keep the processor-generated input_ids and attention_mask for position_ids computation,
+        # as they are guaranteed to be consistent with image_grid_thw / video_grid_thw.
+        multi_modal_inputs = dict(multi_modal_inputs.convert_to_tensors("pt"))
 
         # We must use dict(multi_modal_inputs) to convert BatchFeature values to a new dict
         # because np.array() only keeps the keys for BatchFeature.
-        multi_modal_inputs = dict(multi_modal_inputs.convert_to_tensors("pt"))
         image_grid_thw = multi_modal_inputs.get("image_grid_thw")
         if image_grid_thw is not None:
             images_seqlens = torch.repeat_interleave(image_grid_thw[:, 1] * image_grid_thw[:, 2], image_grid_thw[:, 0])
@@ -798,20 +798,56 @@ class AgentLoopWorker:
             "image_grid_thw": multi_modal_inputs.get("image_grid_thw"),
             "video_grid_thw": multi_modal_inputs.get("video_grid_thw"),
         }
+
+        # Use the processor-generated input_ids for get_rope_index so that the number
+        # of image/video placeholder groups is consistent with image_grid_thw / video_grid_thw.
+        # The original input_ids (from multi-turn tokenization) may have a different number
+        # of placeholder tokens, causing a StopIteration when the grid iterator is exhausted.
+        processor_input_ids = multi_modal_inputs.pop("input_ids", None)
+        processor_attention_mask = multi_modal_inputs.pop("attention_mask", None)
+        rope_input_ids = processor_input_ids if processor_input_ids is not None else input_ids
+        rope_attention_mask = processor_attention_mask if processor_attention_mask is not None else attention_mask
+
         # For transformers>=5.3.0, mm_token_type_ids is only used to calculate position ids.
         if multi_modal_inputs.pop("mm_token_type_ids", None) is not None:
-            mm_token_type_ids = torch.zeros_like(input_ids)
-            mm_token_type_ids[0][input_ids[0] == self.processor.image_token_id] = 1
-            mm_token_type_ids[0][input_ids[0] == self.processor.video_token_id] = 2
+            mm_token_type_ids = torch.zeros_like(rope_input_ids)
+            mm_token_type_ids[0][rope_input_ids[0] == self.processor.image_token_id] = 1
+            mm_token_type_ids[0][rope_input_ids[0] == self.processor.video_token_id] = 2
             multi_modal_kwargs["mm_token_type_ids"] = mm_token_type_ids
 
-        # Model's get_rope_index has been dynamically bind to the processor.
-        vision_position_ids, _ = self.processor.get_rope_index(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            **multi_modal_kwargs,
-        )
-        vision_position_ids = vision_position_ids.transpose(0, 1)  # (3, 1, seq_len) => (1, 3, seq_len)
+        try:
+            # Model's get_rope_index has been dynamically bind to the processor.
+            vision_position_ids, _ = self.processor.get_rope_index(
+                input_ids=rope_input_ids,
+                attention_mask=rope_attention_mask,
+                **multi_modal_kwargs,
+            )
+            vision_position_ids = vision_position_ids.transpose(0, 1)  # (3, 1, seq_len) => (1, 3, seq_len)
+
+            # Adapt vision_position_ids to match the original input_ids length (may differ due
+            # to padding or different tokenization in multi-turn).
+            orig_seq_len = input_ids.shape[1]
+            rope_seq_len = vision_position_ids.shape[2]
+            if rope_seq_len != orig_seq_len:
+                adapted = torch.zeros((1, 3, orig_seq_len), dtype=vision_position_ids.dtype)
+                # Copy from right (right-aligned, matching left-padded input_ids).
+                copy_len = min(rope_seq_len, orig_seq_len)
+                adapted[:, :, -copy_len:] = vision_position_ids[:, :, -copy_len:]
+                vision_position_ids = adapted
+        except (StopIteration, RuntimeError) as e:
+            if "StopIteration" in str(type(e).__name__) or "StopIteration" in str(e):
+                logger.warning(
+                    "Failed to compute vision position ids via get_rope_index (grid_thw mismatch), "
+                    "falling back to sequential position ids: %s",
+                    e,
+                )
+                # Fallback: use sequential position ids expanded to 3 dims for mrope.
+                valid_mask = attention_mask[0].bool()
+                seq_pos = torch.zeros((1, input_ids.shape[1]), dtype=torch.long)
+                seq_pos[0, valid_mask] = torch.arange(valid_mask.sum().item())
+                vision_position_ids = seq_pos.unsqueeze(0).expand(1, 3, -1)  # (1, 3, seq_len)
+            else:
+                raise
 
         valid_mask = attention_mask[0].bool()
         text_position_ids = torch.ones((1, len(input_ids[0])), dtype=torch.long)
@@ -875,13 +911,40 @@ class AgentLoopWorker:
         input_ids = torch.cat([input.input_ids for input in inputs], dim=0)
         position_ids = torch.cat([input.position_ids for input in inputs], dim=0)
         optional_outputs = {}
-        if inputs[0].response_logprobs is not None:
-            optional_outputs["rollout_log_probs"] = torch.cat([input.response_logprobs for input in inputs], dim=0)
-        if inputs[0].routed_experts is not None:
-            optional_outputs["routed_experts"] = torch.cat([input.routed_experts for input in inputs], dim=0)
-        if inputs[0].teacher_logprobs is not None and inputs[0].teacher_ids is not None:
-            optional_outputs["teacher_logprobs"] = torch.cat([input.teacher_logprobs for input in inputs], dim=0)
-            optional_outputs["teacher_ids"] = torch.cat([input.teacher_ids for input in inputs], dim=0)
+        if any(input.response_logprobs is not None for input in inputs):
+            # Some samples may have None response_logprobs (e.g., due to tool call decode failures).
+            # Fill missing logprobs with zeros matching the expected response shape.
+            response_logprobs_list = []
+            for inp in inputs:
+                if inp.response_logprobs is not None:
+                    response_logprobs_list.append(inp.response_logprobs)
+                else:
+                    response_logprobs_list.append(torch.zeros_like(inp.response_ids, dtype=torch.float32))
+            optional_outputs["rollout_log_probs"] = torch.cat(response_logprobs_list, dim=0)
+        if any(input.routed_experts is not None for input in inputs):
+            routed_experts_list = []
+            for inp in inputs:
+                if inp.routed_experts is not None:
+                    routed_experts_list.append(inp.routed_experts)
+                else:
+                    # Create zero tensor matching the shape of a valid routed_experts entry.
+                    ref = next(i.routed_experts for i in inputs if i.routed_experts is not None)
+                    routed_experts_list.append(torch.zeros_like(ref))
+            optional_outputs["routed_experts"] = torch.cat(routed_experts_list, dim=0)
+        if any(input.teacher_logprobs is not None and input.teacher_ids is not None for input in inputs):
+            teacher_logprobs_list = []
+            teacher_ids_list = []
+            for inp in inputs:
+                if inp.teacher_logprobs is not None and inp.teacher_ids is not None:
+                    teacher_logprobs_list.append(inp.teacher_logprobs)
+                    teacher_ids_list.append(inp.teacher_ids)
+                else:
+                    ref_lp = next(i.teacher_logprobs for i in inputs if i.teacher_logprobs is not None)
+                    ref_id = next(i.teacher_ids for i in inputs if i.teacher_ids is not None)
+                    teacher_logprobs_list.append(torch.zeros_like(ref_lp))
+                    teacher_ids_list.append(torch.zeros_like(ref_id))
+            optional_outputs["teacher_logprobs"] = torch.cat(teacher_logprobs_list, dim=0)
+            optional_outputs["teacher_ids"] = torch.cat(teacher_ids_list, dim=0)
         batch = TensorDict(
             {
                 "prompts": prompt_ids,  # [bsz, prompt_length]

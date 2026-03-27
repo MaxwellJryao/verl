@@ -84,8 +84,12 @@ async def ensure_async_iterator(iterable):
 
 
 def qwen2_5_vl_dedup_image_tokens(prompt_ids: list[int], processor):
-    """Deduplicate consecutive image tokens in prompt_ids for Qwen2.5-VL, since vLLM will replicate the
-    <|image_pad|> and <|video_pad|> token by image_data.
+    """Deduplicate consecutive visual placeholder tokens for the Qwen-VL family.
+
+    Some backends rebuild <|image_pad|> and <|video_pad|> runs from raw
+    multimodal inputs, so prompts that were already expanded by the HF
+    processor need to be collapsed back to a single placeholder per asset.
+
     For example,
     ```
     <|vision_start|><|image_pad|><|image_pad|>...<|image_pad|><|vision_end|>
@@ -93,11 +97,30 @@ def qwen2_5_vl_dedup_image_tokens(prompt_ids: list[int], processor):
     <|vision_start|><|image_pad|><|vision_end|>
     ```
     """
-    if processor is not None and "Qwen2VLImageProcessor" in processor.image_processor.__class__.__name__:
-        prompt_ids = np.array(prompt_ids)
-        mask = np.ones(len(prompt_ids), dtype=bool)
-        is_value = (prompt_ids == processor.image_token_id) | (prompt_ids == processor.video_token_id)
-        mask[1:] &= ~(is_value[1:] & is_value[:-1])
-        return prompt_ids[mask].tolist()
-    else:
+    if processor is None:
         return prompt_ids
+
+    processor_name = processor.__class__.__name__
+    image_processor = getattr(processor, "image_processor", None)
+    image_processor_name = image_processor.__class__.__name__ if image_processor is not None else ""
+    is_qwen_vl_processor = processor_name in {"Qwen2_5_VLProcessor", "Qwen3VLProcessor"} or (
+        "Qwen2VLImageProcessor" in image_processor_name
+    )
+    if not is_qwen_vl_processor:
+        return prompt_ids
+
+    token_ids = [token_id for token_id in (getattr(processor, "image_token_id", None), getattr(processor, "video_token_id", None)) if token_id is not None]
+    if not token_ids:
+        return prompt_ids
+
+    prompt_ids_array = np.asarray(prompt_ids.tolist() if hasattr(prompt_ids, "tolist") else prompt_ids)
+    if prompt_ids_array.ndim != 1 or prompt_ids_array.size < 2:
+        return prompt_ids
+
+    is_value = np.isin(prompt_ids_array, token_ids)
+    if not np.any(is_value[1:] & is_value[:-1]):
+        return prompt_ids
+
+    mask = np.ones(len(prompt_ids_array), dtype=bool)
+    mask[1:] &= ~(is_value[1:] & is_value[:-1])
+    return prompt_ids_array[mask].tolist()

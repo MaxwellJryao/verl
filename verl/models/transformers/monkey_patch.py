@@ -19,12 +19,38 @@ import sys
 from types import SimpleNamespace
 from typing import Optional
 
+import logging
+
 import torch
 from transformers.modeling_flash_attention_utils import _flash_attention_forward
 from transformers.modeling_utils import PreTrainedModel
 
 from verl.utils.import_utils import is_trl_available
 from verl.utils.transformers_compat import is_transformers_version_in_range
+
+_logger = logging.getLogger(__name__)
+
+# Monkey-patch transformers' _is_packed_sequence to handle 3D+ position_ids (mRoPE).
+# Qwen3.5/Qwen3-VL use 3D position_ids [3, batch_size, seq_len] for multi-dimensional RoPE.
+# The original function assumes 2D [batch_size, seq_len] and misinterprets the first dimension,
+# causing incorrect cu_seqlens computation and CUDA illegal memory access in flash attention.
+try:
+    import transformers.modeling_flash_attention_utils as _fa_utils
+
+    _original_is_packed_sequence = _fa_utils._is_packed_sequence
+
+    def _patched_is_packed_sequence(position_ids, batch_size):
+        if position_ids is not None and position_ids.ndim != 2:
+            return False
+        return _original_is_packed_sequence(position_ids, batch_size)
+
+    _fa_utils._is_packed_sequence = _patched_is_packed_sequence
+    _logger.info("Applied monkey-patch for _is_packed_sequence to support 3D+ mRoPE position_ids")
+except (ImportError, AttributeError):
+    _logger.warning(
+        "Failed to monkey-patch _is_packed_sequence — transformers version may not have this function"
+    )
+
 from verl.utils.ulysses import (
     gather_heads_scatter_seq,
     gather_seq_scatter_heads,
