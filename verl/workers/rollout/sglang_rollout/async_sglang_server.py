@@ -62,7 +62,7 @@ from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
 from verl.workers.rollout.sglang_rollout.sglang_rollout import _set_envs_and_config
 from verl.workers.rollout.sglang_rollout.utils import SGLANG_LORA_NAME
-from verl.workers.rollout.utils import get_max_position_embeddings, run_uvicorn
+from verl.workers.rollout.utils import get_max_position_embeddings, qwen2_5_vl_dedup_image_tokens, run_uvicorn
 
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
@@ -404,6 +404,11 @@ class SGLangHttpServer:
         )
         sampling_params["max_new_tokens"] = max_new_tokens
         return_logprob = sampling_params.pop("logprobs", False)
+
+        if image_data is not None or video_data is not None:
+            # HF processors may have already expanded Qwen-VL visual placeholders,
+            # while SGLang rebuilds them from raw multimodal inputs.
+            prompt_ids = qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
 
         request = {
             "rid": request_id,
