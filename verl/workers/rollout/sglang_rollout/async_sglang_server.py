@@ -25,10 +25,23 @@ import sglang.srt.entrypoints.engine
 import torch
 from packaging import version
 from ray.actor import ActorHandle
+
+try:
+    # New SGLang: _launch_subprocesses moved to Engine classmethod
+    from sglang.srt.entrypoints.engine import Engine as _SglangEngine
+
+    _launch_subprocesses = _SglangEngine._launch_subprocesses
+    _NEW_SGLANG_LAUNCH_API = True
+except (ImportError, AttributeError):
+    _NEW_SGLANG_LAUNCH_API = False
+
+if not _NEW_SGLANG_LAUNCH_API:
+    # Old SGLang (<=0.5.9): _launch_subprocesses is a module-level function
+    from sglang.srt.entrypoints.http_server import _launch_subprocesses
+
 from sglang.srt.entrypoints.http_server import (
     ServerArgs,
     _GlobalState,
-    _launch_subprocesses,
     app,
     set_global_state,
 )
@@ -264,12 +277,23 @@ class SGLangHttpServer:
         os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
         server_args = ServerArgs(**args)
         if version.parse(sglang.__version__) >= version.parse("0.5.7"):
-            self.tokenizer_manager, self.template_manager, self.scheduler_info, *_ = _launch_subprocesses(
-                server_args=server_args,
-                init_tokenizer_manager_func=sglang.srt.entrypoints.engine.init_tokenizer_manager,
-                run_scheduler_process_func=sglang.srt.entrypoints.engine.run_scheduler_process,
-                run_detokenizer_process_func=sglang.srt.entrypoints.engine.run_detokenizer_process,
-            )
+            if _NEW_SGLANG_LAUNCH_API:
+                # New SGLang: returns (tokenizer_manager, template_manager, port_args, scheduler_init_result)
+                self.tokenizer_manager, self.template_manager, _port_args, _sched_result = _launch_subprocesses(
+                    server_args=server_args,
+                    init_tokenizer_manager_func=sglang.srt.entrypoints.engine.init_tokenizer_manager,
+                    run_scheduler_process_func=sglang.srt.entrypoints.engine.run_scheduler_process,
+                    run_detokenizer_process_func=sglang.srt.entrypoints.engine.run_detokenizer_process,
+                )
+                self.scheduler_info = _sched_result.scheduler_infos
+            else:
+                # Old SGLang (<=0.5.9): returns (tokenizer_manager, template_manager, scheduler_infos, port_args)
+                self.tokenizer_manager, self.template_manager, self.scheduler_info, *_ = _launch_subprocesses(
+                    server_args=server_args,
+                    init_tokenizer_manager_func=sglang.srt.entrypoints.engine.init_tokenizer_manager,
+                    run_scheduler_process_func=sglang.srt.entrypoints.engine.run_scheduler_process,
+                    run_detokenizer_process_func=sglang.srt.entrypoints.engine.run_detokenizer_process,
+                )
         else:
             self.tokenizer_manager, self.template_manager, self.scheduler_info, *_ = _launch_subprocesses(
                 server_args=server_args
@@ -283,7 +307,9 @@ class SGLangHttpServer:
             _GlobalState(
                 tokenizer_manager=self.tokenizer_manager,
                 template_manager=self.template_manager,
-                scheduler_info=self.scheduler_info,
+                scheduler_info=self.scheduler_info[0]
+                if isinstance(self.scheduler_info, list | tuple)
+                else self.scheduler_info,
             )
         )
         app.is_single_tokenizer_mode = True
