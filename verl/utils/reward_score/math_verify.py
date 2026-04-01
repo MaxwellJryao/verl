@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import multiprocessing
 import threading
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeoutError
@@ -19,6 +20,10 @@ from concurrent.futures import TimeoutError as FuturesTimeoutError
 try:
     from math_verify.errors import TimeoutException
 except ImportError:
+
+    class TimeoutException(Exception):
+        pass
+
     print("To use Math-Verify, please install it first by running `pip install math-verify`.")
 
 _pool = None
@@ -30,7 +35,7 @@ def _get_pool():
     if _pool is None:
         with _pool_lock:
             if _pool is None:
-                _pool = ProcessPoolExecutor(max_workers=4)
+                _pool = ProcessPoolExecutor(max_workers=4, mp_context=multiprocessing.get_context("spawn"))
     return _pool
 
 
@@ -57,6 +62,6 @@ def compute_score(model_output: str, ground_truth: str, timeout_score: float = 0
         ret_score = future.result(timeout=timeout)
     except (FuturesTimeoutError, TimeoutException):
         ret_score = timeout_score
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Error in math_verify compute_score: {e}")
     return ret_score
